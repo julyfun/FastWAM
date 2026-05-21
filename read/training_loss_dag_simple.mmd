@@ -1,0 +1,56 @@
+flowchart TB
+
+    subgraph IN["inputs"]
+        i_lat["input['input_latents'] [B,C,T,H,W]"]
+        i_act["input['action'] [B,T,A]"]
+        i_ctx["input['context'] [B,L,D]"]
+        i_mask["input['context_mask'] [B,L]"]
+    end
+
+    subgraph VID["Video 分支"]
+        v_pre(["video_expert.pre_dit"])
+        mot(["MoT"])
+        v_post(["video_expert.post_dit"])
+        loss_v["loss_video"]
+    end
+
+    subgraph ACT["Action 分支"]
+        a_pre(["action_expert.pre_dit"])
+        a_post(["action_expert.post_dit"])
+        loss_a["loss_action"]
+    end
+
+    total["loss_total<br/>λ_v·loss_video + λ_a·loss_action"]
+
+    i_lat --> v_pre
+    i_ctx --> v_pre
+    i_mask --> v_pre
+    i_act --> v_pre
+
+    i_act --> a_pre
+    i_ctx --> a_pre
+    i_mask --> a_pre
+
+    v_pre -->|"[B, S_v, D_v]"| mot
+    a_pre -->|"[B, T_act, D_a]"| mot
+    mot -->|"[B, S_v, D_v]"| v_post
+    mot -->|"[B, T_act, D_a]"| a_post
+    v_pre -->|"pre_state<br/>t [B, S_v, D_v]"| v_post
+    a_pre -->|"pre_state<br/>t [B, D_a]"| a_post
+
+    v_post -->|"[B, C, T, H, W]"| loss_v
+    i_lat -.-> loss_v
+
+    a_post -->|"[B, T_act, A]"| loss_a
+    i_act -.-> loss_a
+
+    loss_v -->|scalar| total
+    loss_a -->|scalar| total
+
+    classDef leaf fill:#e3f2fd,stroke:#1565c0
+    classDef learnable fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    classDef loss fill:#ffebee,stroke:#c62828,stroke-width:2px
+
+    class i_lat,i_act,i_ctx,i_mask leaf
+    class v_pre,mot,v_post,a_pre,a_post learnable
+    class loss_v,loss_a,total loss

@@ -1,0 +1,135 @@
+flowchart TB
+
+    subgraph INPUTS["inputs（build_inputs 叶子）"]
+        i_ctx["input['context']<br/>[B, L, D]"]
+        i_ctx_mask["input['context_mask']<br/>[B, L]"]
+        i_latents["input['input_latents']<br/>[B, C, T_lat, H_lat, W_lat]"]
+        i_ff_latents["input['first_frame_latents']<br/>[B, C, 1, H_lat, W_lat] | None"]
+        i_fuse["input['fuse_vae_embedding_in_latents']<br/>bool"]
+        i_action["input['action']<br/>[B, T_act, A]"]
+        i_act_pad["input['action_is_pad']<br/>[B, T_act] | None"]
+        i_img_pad["input['image_is_pad']<br/>[B, T_v] | None"]
+    end
+
+    subgraph VIDEO_NOISE["Video 扩散前处理（无梯度模块）"]
+        noise_v["noise_video<br/>randn_like(input_latents)"]
+        t_v["timestep_video<br/>train_video_scheduler.sample_training_t → [B]"]
+        latents["latents<br/>add_noise → [B,C,T_lat,H_lat,W_lat]"]
+        tgt_v["target_video<br/>training_target → [B,C,T_lat,H_lat,W_lat]"]
+        ff_overwrite["首帧覆盖<br/>latents[:,:,0:1] ← first_frame_latents"]
+        slice_v["可选切片<br/>pred/target 去掉 t=0<br/>→ [B,C,T_lat-1,...]"]
+    end
+
+    subgraph ACTION_NOISE["Action 扩散前处理（无梯度模块）"]
+        noise_a["noise_action<br/>randn_like(action)"]
+        t_a["timestep_action<br/>train_action_scheduler.sample_training_t → [B]"]
+        noisy_a["noisy_action<br/>add_noise → [B,T_act,A]"]
+        tgt_a["target_action<br/>training_target → [B,T_act,A]"]
+    end
+
+    subgraph VIDEO_ENC["Video 分支 · 可学习模块"]
+        v_pre(["video_expert.pre_dit<br/>patchify · time_emb · text_emb · action_emb"])
+        mot(["MoT<br/>mixed-attn transformer"])
+        v_post(["video_expert.post_dit<br/>head · unpatchify"])
+    end
+
+    subgraph ACTION_ENC["Action 分支 · 可学习模块"]
+        a_pre(["action_expert.pre_dit<br/>action_encoder · text_emb · time_emb"])
+        a_post(["action_expert.post_dit<br/>head"])
+    end
+
+    subgraph VIDEO_LOSS["Video Loss 聚合"]
+        pred_v["pred_video<br/>[B,C,T_lat',H_lat,W_lat]"]
+        v_mse["token MSE + spatial mean<br/>→ video_loss_token [B,T_lat']"]
+        v_mask["image_is_pad 掩码加权<br/>→ loss_video_per_sample [B]"]
+        v_w["video_weight<br/>training_weight(timestep_video) [B]"]
+        loss_v["loss_video<br/>mean(loss_ps × weight) → scalar"]
+    end
+
+    subgraph ACTION_LOSS["Action Loss 聚合"]
+        pred_a["pred_action<br/>[B,T_act,A]"]
+        a_mse["token MSE<br/>→ action_loss_token [B,T_act]"]
+        a_mask["action_is_pad 掩码加权<br/>→ action_loss_per_sample [B]"]
+        a_w["action_weight<br/>training_weight(timestep_action) [B]"]
+        loss_a["loss_action<br/>mean(loss_ps × weight) → scalar"]
+    end
+
+    loss_total["loss_total<br/>λ_video·loss_video + λ_action·loss_action"]
+
+    %% ── inputs → video noise ──
+    i_latents --> noise_v
+    i_latents --> t_v
+    i_latents --> latents
+    noise_v --> latents
+    t_v --> latents
+    i_latents --> tgt_v
+    noise_v --> tgt_v
+    t_v --> tgt_v
+
+    i_ff_latents -.->|if not None| ff_overwrite
+    latents --> ff_overwrite
+    ff_overwrite --> v_pre
+    latents -->|first_frame_latents is None| v_pre
+
+    t_v --> v_pre
+    i_ctx --> v_pre
+    i_ctx_mask --> v_pre
+    i_action --> v_pre
+    i_fuse --> v_pre
+
+    %% ── inputs → action noise ──
+    i_action --> noise_a
+    i_action --> t_a
+    i_action --> noisy_a
+    noise_a --> noisy_a
+    t_a --> noisy_a
+    i_action --> tgt_a
+    noise_a --> tgt_a
+    t_a --> tgt_a
+
+    t_a --> a_pre
+    noisy_a --> a_pre
+    i_ctx --> a_pre
+    i_ctx_mask --> a_pre
+
+    %% ── MoT 联合前向 ──
+    v_pre -->|"video_tokens [B,S_v,D_h]"| mot
+    a_pre -->|"action_tokens [B,T_act,D_h]"| mot
+    mot -->|"tokens_out['video']"| v_post
+    mot -->|"tokens_out['action']"| a_post
+    v_pre --> v_post
+    a_pre --> a_post
+
+    v_post --> pred_v
+    pred_v --> slice_v
+    tgt_v --> slice_v
+    i_ff_latents -.->|if not None| slice_v
+
+    slice_v --> v_mse
+    i_img_pad --> v_mask
+    v_mse --> v_mask
+    t_v --> v_w
+    v_mask --> loss_v
+    v_w --> loss_v
+
+    a_post --> pred_a
+    pred_a --> a_mse
+    tgt_a --> a_mse
+    i_act_pad --> a_mask
+    a_mse --> a_mask
+    t_a --> a_w
+    a_mask --> loss_a
+    a_w --> loss_a
+
+    loss_v --> loss_total
+    loss_a --> loss_total
+
+    classDef leaf fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef learnable fill:#fff8e1,stroke:#f57f17,color:#e65100,stroke-width:2px
+    classDef sched fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
+    classDef loss fill:#ffebee,stroke:#c62828,color:#b71c1c,stroke-width:2px
+
+    class i_ctx,i_ctx_mask,i_latents,i_ff_latents,i_fuse,i_action,i_act_pad,i_img_pad leaf
+    class v_pre,mot,v_post,a_pre,a_post learnable
+    class noise_v,t_v,latents,tgt_v,ff_overwrite,noise_a,t_a,noisy_a,tgt_a,slice_v,v_w,a_w sched
+    class v_mse,v_mask,loss_v,a_mse,a_mask,loss_a,loss_total,pred_v,pred_a loss
